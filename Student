@@ -1,0 +1,54 @@
+package com.student.application.model;
+
+import org.apache.tomcat.util.http.fileupload.RequestContext;
+
+import java.util.ArrayList;
+
+/**
+ * Request arguments for getting saved payment instrument
+ *
+ */
+
+public class Student {
+    private long studentId;
+    private String studentName;
+    private String course;
+    ArrayList<Laptop> laptops;
+
+    public Student(long studentId, String studentName, String course, RequestContext context) {
+        this.studentId = studentId;
+        this.studentName = studentName;
+        this.course = course;
+    }
+
+    public Student() {
+    }
+
+
+
+    public long getStudentId() {
+        return studentId;
+    }
+
+    public void setStudentId(long studentId) {
+        this.studentId = studentId;
+    }
+
+    public String getStudentName() {
+        return studentName;
+    }
+
+    public void setStudentName(String studentName) {
+        this.studentName = studentName;
+    }
+
+    public String getCourse() {
+        return course;
+    }
+
+    public void setCourse(String course) {
+        this.course = course;
+    }
+
+
+}
