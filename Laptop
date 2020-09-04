@@ -1,0 +1,7 @@
+package com.student.application.model;
+
+public class Laptop {
+    private Integer laptopId;
+    private String laptopBrand;
+    private Integer laptopPrice;
+}
