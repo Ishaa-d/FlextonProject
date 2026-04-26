@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+Incident Intelligence Assistant - Phase 5
+ServiceNow + Confluence + Splunk + Prometheus/Thanos Metrics + GitHub Copilot AI.
+
+Usage:
+  python incident_intelligence_v5.py "thanos store failed disk 87%"
+  python incident_intelligence_v5.py "thanos store failed" --host hostname --window 2h
+  python incident_intelligence_v5.py "thanos store failed" --no-ai
+
+Environment variables:
+  export SNOW_INSTANCE=https://your-company.service-now.com
+  export SNOW_USER=your_service_account
+  export SNOW_PASS=your_password
+
+  export CONFLUENCE_URL=https://your-company.atlassian.net/wiki
+  export CONFLUENCE_USER=your_email@company.com
+  export CONFLUENCE_TOKEN=your_api_token
+
+  export SPLUNK_HOST=https://your-splunk.company.com:8089
+  export SPLUNK_USER=your_splunk_user
+  export SPLUNK_PASS=your_splunk_password
+  export SPLUNK_TOKEN=your_splunk_token
+  export SPLUNK_INDEX=odp_db
+
+  export THANOS_URL=http://hostname:10903   # Thanos Query Frontend HTTP
+  export THANOS_LOOKBACK=1h                         # How far back to check metrics
+
+  export COPILOT_TOKEN=your_github_copilot_token
+"""
+
+import requests
+import sys
+import argparse
+import time
+import os
+import json
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════
+
+SERVICENOW_INSTANCE  = os.getenv("SNOW_INSTANCE",   "https://your-company.service-now.com")
+SERVICENOW_USER      = os.getenv("SNOW_USER",        "your_service_account")
+SERVICENOW_PASS      = os.getenv("SNOW_PASS",        "your_password")
+
+CONFLUENCE_BASE_URL  = os.getenv("CONFLUENCE_URL",   "https://your-company.atlassian.net/wiki")
+CONFLUENCE_USER      = os.getenv("CONFLUENCE_USER",  "your_email@company.com")
+CONFLUENCE_TOKEN     = os.getenv("CONFLUENCE_TOKEN", "your_api_token")
+CONFLUENCE_SPACES    = ["OPS", "INFRA", "PLAT"]
+
+SPLUNK_HOST          = os.getenv("SPLUNK_HOST",      "https://your-splunk.company.com:8089")
+SPLUNK_USER          = os.getenv("SPLUNK_USER",      "your_splunk_user")
+SPLUNK_PASS          = os.getenv("SPLUNK_PASS",      "your_splunk_password")
+SPLUNK_TOKEN         = os.getenv("SPLUNK_TOKEN",     "")
+SPLUNK_INDEX         = os.getenv("SPLUNK_INDEX",     "odp_db")
+
+# Thanos Query Frontend — HTTP port from your systemd config
+THANOS_URL           = os.getenv("THANOS_URL",       "http://hostname:10903")
+THANOS_LOOKBACK      = os.getenv("THANOS_LOOKBACK",  "1h")
+
+COPILOT_TOKEN        = os.getenv("COPILOT_TOKEN",    "")
+COPILOT_API_URL      = "https://api.githubcopilot.com/chat/completions"
+COPILOT_MODEL        = "gpt-4o"
+
+MAX_SNOW_RESULTS     = 5
+MAX_CONF_RESULTS     = 3
+MAX_SPLUNK_RESULTS   = 20
+SPLUNK_POLL_INTERVAL = 2
+SPLUNK_MAX_WAIT      = 30
+
+# ── Thanos/Prometheus metrics to always collect ────────────────
+# These are the most useful signals for diagnosing store issues.
+# Add or remove based on what your environment exposes.
+THANOS_METRICS = [
+    {
+        "name":        "store_up",
+        "promql":      "up{job=~'thanos.*'}",
+        "description": "Thanos component availability",
+        "unit":        "bool"
+    },
+    {
+        "name":        "compaction_failures",
+        "promql":      "increase(thanos_compact_group_compactions_failures_total[1h])",
+        "description": "Compaction failures in last 1h",
+        "unit":        "count"
+    },
+    {
+        "name":        "store_grpc_errors",
+        "promql":      "increase(thanos_store_nodes_grpc_connections[1h])",
+        "description": "gRPC connection changes in last 1h",
+        "unit":        "count"
+    },
+    {
+        "name":        "objstore_failures",
+        "promql":      "increase(thanos_objstore_bucket_operations_failures_total[1h])",
+        "description": "Object store operation failures in last 1h",
+        "unit":        "count"
+    },
+    {
+        "name":        "memory_usage",
+        "promql":      "process_resident_memory_bytes{job=~'thanos.*'}",
+        "description": "Thanos process memory usage",
+        "unit":        "bytes"
+    },
+    {
+        "name":        "series_fetched",
+        "promql":      "increase(thanos_store_series_data_fetched_bytes_total[1h])",
+        "description": "Data fetched from store in last 1h",
+        "unit":        "bytes"
+    },
+    {
+        "name":        "query_duration_p99",
+        "promql":      "histogram_quantile(0.99, thanos_query_range_requested_timespan_seconds_bucket)",
+        "description": "P99 query duration",
+        "unit":        "seconds"
+    },
+    {
+        "name":        "disk_usage",
+        "promql":      "node_filesystem_avail_bytes{mountpoint='/u01'}",
+        "description": "Available disk on /u01",
+        "unit":        "bytes"
+    }
+]
+
+
+# ══════════════════════════════════════════════════════════════
+#  ServiceNow
+# ══════════════════════════════════════════════════════════════
+
+def search_incidents(query: str) -> list:
+    url        = f"{SERVICENOW_INSTANCE}/api/now/table/incident"
+    keywords   = query.strip().split()
+    conditions = [f"short_descriptionLIKE{kw}" for kw in keywords[:3]]
+    snow_query = "^OR".join(conditions) + "^stateIN6,7"
+    params = {
+        "sysparm_query":                  snow_query,
+        "sysparm_limit":                  MAX_SNOW_RESULTS,
+        "sysparm_fields":                 (
+            "number,short_description,close_notes,"
+            "resolved_at,priority,assigned_to,cmdb_ci,category"
+        ),
+        "sysparm_display_value":          "true",
+        "sysparm_exclude_reference_link": "true"
+    }
+    try:
+        r = requests.get(url, auth=(SERVICENOW_USER, SERVICENOW_PASS),
+                         headers={"Accept": "application/json"},
+                         params=params, timeout=10)
+        r.raise_for_status()
+        return r.json().get("result", [])
+    except requests.exceptions.ConnectionError:
+        print("  ⚠️  ServiceNow unreachable — skipping.")
+        return []
+    except requests.exceptions.HTTPError as e:
+        print(f"  ⚠️  ServiceNow error {e.response.status_code} — skipping.")
+        return []
+    except requests.exceptions.Timeout:
+        print("  ⚠️  ServiceNow timed out — skipping.")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════
+#  Confluence
+# ══════════════════════════════════════════════════════════════
+
+def search_confluence(query: str) -> list:
+    url          = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
+    space_filter = " OR ".join([f'space="{s}"' for s in CONFLUENCE_SPACES])
+    cql          = f'type=page AND ({space_filter}) AND text~"{query}"'
+    params       = {"cql": cql, "limit": MAX_CONF_RESULTS,
+                    "expand": "excerpt,metadata.labels,version,space"}
+    try:
+        r = requests.get(url, auth=(CONFLUENCE_USER, CONFLUENCE_TOKEN),
+                         headers={"Accept": "application/json"},
+                         params=params, timeout=10)
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except requests.exceptions.ConnectionError:
+        print("  ⚠️  Confluence unreachable — skipping.")
+        return []
+    except requests.exceptions.HTTPError as e:
+        print(f"  ⚠️  Confluence error {e.response.status_code} — skipping.")
+        return []
+    except requests.exceptions.Timeout:
+        print("  ⚠️  Confluence timed out — skipping.")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════
+#  Splunk
+# ══════════════════════════════════════════════════════════════
+
+def _splunk_headers() -> dict:
+    return {"Authorization": f"Bearer {SPLUNK_TOKEN}"} if SPLUNK_TOKEN else {}
+
+def _splunk_auth():
+    return None if SPLUNK_TOKEN else (SPLUNK_USER, SPLUNK_PASS)
+
+def build_splunk_query(query: str, host: str = None) -> str:
+    stop_words  = {"the","a","an","is","are","was","and","or",
+                   "in","on","at","to","for","of","with","not"}
+    keywords    = [w for w in query.lower().split() if w not in stop_words]
+    kw_str      = " ".join(keywords[:5])
+    host_filter = f'host="{host}"' if host else ""
+    return (
+        f'search index={SPLUNK_INDEX} {host_filter} {kw_str} '
+        f'| head {MAX_SPLUNK_RESULTS} '
+        f'| table _time, host, source, sourcetype, log_level, message '
+        f'| sort -_time'
+    ).strip()
+
+def search_splunk(query: str, host: str = None, window: str = "1h") -> dict:
+    spl      = build_splunk_query(query, host)
+    job_data = {"search": spl, "earliest_time": f"-{window}",
+                "latest_time": "now", "output_mode": "json"}
+    try:
+        r = requests.post(f"{SPLUNK_HOST}/services/search/jobs",
+                          data=job_data, headers=_splunk_headers(),
+                          auth=_splunk_auth(), verify=False, timeout=10)
+        r.raise_for_status()
+        sid = r.json().get("sid")
+        if not sid:
+            return {}
+    except Exception as e:
+        print(f"  ⚠️  Splunk error: {e} — skipping.")
+        return {}
+
+    status_url = f"{SPLUNK_HOST}/services/search/jobs/{sid}"
+    waited = 0
+    while waited < SPLUNK_MAX_WAIT:
+        time.sleep(SPLUNK_POLL_INTERVAL)
+        waited += SPLUNK_POLL_INTERVAL
+        try:
+            sr    = requests.get(status_url, params={"output_mode": "json"},
+                                 headers=_splunk_headers(), auth=_splunk_auth(),
+                                 verify=False, timeout=10)
+            state = sr.json().get("entry",[{}])[0].get("content",{}).get("dispatchState","")
+            if state == "DONE":  break
+            if state == "FAILED": return {}
+        except Exception:
+            pass
+
+    try:
+        rr = requests.get(
+            f"{SPLUNK_HOST}/services/search/jobs/{sid}/results",
+            params={"output_mode": "json", "count": MAX_SPLUNK_RESULTS},
+            headers=_splunk_headers(), auth=_splunk_auth(), verify=False, timeout=10)
+        rr.raise_for_status()
+        events      = rr.json().get("results", [])
+        error_count = sum(1 for e in events if str(e.get("log_level","")).upper() in ("ERROR","ERR","CRITICAL"))
+        warn_count  = sum(1 for e in events if str(e.get("log_level","")).upper() in ("WARN","WARNING"))
+        return {"events": events, "error_count": error_count,
+                "warn_count": warn_count, "spl": spl, "window": window}
+    except Exception as e:
+        print(f"  ⚠️  Splunk results error: {e}")
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  Thanos / Prometheus Metrics
+# ══════════════════════════════════════════════════════════════
+
+def query_prometheus(promql: str) -> list:
+    """
+    Run an instant query against the Thanos Query Frontend.
+    Returns list of result dicts: [{metric: {}, value: [ts, val]}, ...]
+    """
+    url    = f"{THANOS_URL}/api/v1/query"
+    params = {"query": promql, "time": int(time.time())}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "success":
+            return data.get("data", {}).get("result", [])
+        return []
+    except requests.exceptions.ConnectionError:
+        return []
+    except requests.exceptions.HTTPError:
+        return []
+    except requests.exceptions.Timeout:
+        return []
+    except Exception:
+        return []
+
+
+def query_prometheus_range(promql: str, lookback: str = "1h", step: str = "60") -> list:
+    """
+    Run a range query to get metric values over time.
+    Useful for spotting spikes and trends.
+    Returns list of {metric, values} dicts.
+    """
+    url     = f"{THANOS_URL}/api/v1/query_range"
+    end     = int(time.time())
+    # Parse lookback string like "1h", "30m", "4h"
+    unit    = lookback[-1]
+    amount  = int(lookback[:-1])
+    seconds = amount * {"h": 3600, "m": 60, "d": 86400}.get(unit, 3600)
+    start   = end - seconds
+
+    params  = {"query": promql, "start": start, "end": end,
+               "step": step, "dedup": "true", "partial_response": "true"}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "success":
+            return data.get("data", {}).get("result", [])
+        return []
+    except Exception:
+        return []
+
+
+def format_metric_value(value: str, unit: str) -> str:
+    """Human-readable formatting for metric values."""
+    try:
+        v = float(value)
+        if unit == "bytes":
+            if v >= 1_073_741_824: return f"{v/1_073_741_824:.2f} GB"
+            if v >= 1_048_576:     return f"{v/1_048_576:.2f} MB"
+            if v >= 1_024:         return f"{v/1_024:.2f} KB"
+            return f"{v:.0f} B"
+        if unit == "bool":
+            return "✅ UP" if v == 1 else "❌ DOWN"
+        if unit == "seconds":
+            return f"{v:.3f}s"
+        if unit == "count":
+            return f"{v:.0f}"
+        return f"{v:.4g}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def collect_thanos_metrics() -> list:
+    """
+    Query all metrics defined in THANOS_METRICS.
+    Returns list of result dicts with name, description, results, status.
+    """
+    collected = []
+
+    for m in THANOS_METRICS:
+        results = query_prometheus(m["promql"])
+
+        # Summarise results into digestible form
+        parsed = []
+        for r in results:
+            labels = r.get("metric", {})
+            val    = r.get("value", [None, "N/A"])[1]
+            parsed.append({
+                "labels":    labels,
+                "value":     val,
+                "formatted": format_metric_value(val, m["unit"])
+            })
+
+        collected.append({
+            "name":        m["name"],
+            "description": m["description"],
+            "promql":      m["promql"],
+            "unit":        m["unit"],
+            "results":     parsed,
+            "available":   len(parsed) > 0
+        })
+
+    return collected
+
+
+def summarise_metrics_for_ai(metrics: list) -> str:
+    """Compact text summary of metrics for the AI prompt."""
+    lines = []
+    for m in metrics:
+        if not m["available"]:
+            lines.append(f"- {m['description']}: no data")
+            continue
+        for r in m["results"][:3]:   # Cap at 3 series per metric
+            label_str = ", ".join(
+                f"{k}={v}" for k, v in r["labels"].items()
+                if k not in ("__name__",)
+            )
+            lines.append(
+                f"- {m['description']}"
+                f"{' [' + label_str + ']' if label_str else ''}: "
+                f"{r['formatted']}"
+            )
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+#  AI Root Cause — GitHub Copilot
+# ══════════════════════════════════════════════════════════════
+
+def build_ai_prompt(query, incidents, pages, splunk_data, metrics) -> str:
+    # ServiceNow
+    snow_summary = ""
+    for inc in incidents[:3]:
+        snow_summary += (
+            f"- {inc.get('number')} (P{inc.get('priority','?')}): "
+            f"{inc.get('short_description','')} | "
+            f"Resolution: {inc.get('close_notes','none')[:150]}\n"
+        )
+
+    # Confluence
+    conf_summary = ""
+    for page in pages[:2]:
+        excerpt = page.get("excerpt","").replace("@@@hl@@@","").replace("@@@endhl@@@","")
+        conf_summary += f"- {page.get('title','')}: {excerpt[:200]}\n"
+
+    # Splunk
+    splunk_summary = ""
+    if splunk_data:
+        events      = splunk_data.get("events", [])
+        error_count = splunk_data.get("error_count", 0)
+        warn_count  = splunk_data.get("warn_count", 0)
+        splunk_summary = f"Log stats: {len(events)} lines, {error_count} errors, {warn_count} warnings.\n"
+        for e in events[:5]:
+            splunk_summary += (
+                f"  [{e.get('_time','')[:19]}] "
+                f"{e.get('log_level','')}: "
+                f"{str(e.get('message',''))[:120]}\n"
+            )
+
+    # Prometheus/Thanos
+    metrics_summary = summarise_metrics_for_ai(metrics) if metrics else "No metrics available."
+
+    return f"""You are an expert platform/infrastructure engineer diagnosing a production incident.
+
+INCIDENT DESCRIPTION:
+{query}
+
+PAST SIMILAR INCIDENTS (ServiceNow):
+{snow_summary or 'None found.'}
+
+RELEVANT RUNBOOKS (Confluence):
+{conf_summary or 'None found.'}
+
+LIVE LOG SIGNALS (Splunk):
+{splunk_summary or 'No Splunk data.'}
+
+LIVE PROMETHEUS/THANOS METRICS:
+{metrics_summary}
+
+Based on ALL signals above, provide a concise analysis in this exact structure:
+
+MOST LIKELY CAUSE:
+[1-2 sentences — what is probably wrong and why]
+
+SUPPORTING EVIDENCE:
+[3-4 bullet points referencing specific metrics, log signals, or past incidents]
+
+SUGGESTED NEXT STEPS:
+[4-5 numbered, immediately actionable steps for the on-call engineer]
+
+CONFIDENCE:
+[High / Medium / Low — one sentence explaining why]
+
+Be specific. Reference actual metric values and incident numbers where relevant.
+Do not repeat input data verbatim. Focus entirely on what to do next."""
+
+
+def get_ai_summary_stub(query: str) -> str:
+    return f"""[STUB — Set COPILOT_TOKEN env var to enable real AI analysis]
+
+MOST LIKELY CAUSE:
+Thanos store compaction backlog causing disk exhaustion on /u01/dse_data.
+Prometheus metrics confirm available disk is critically low.
+
+SUPPORTING EVIDENCE:
+• node_filesystem_avail_bytes shows < 15% free on /u01 mount
+• thanos_compact_group_compactions_failures_total increased in last 1h
+• Splunk shows repeated ERROR lines from thanos-store service
+• INC0045231 matches this exact pattern — resolved by clearing compaction tmp files
+
+SUGGESTED NEXT STEPS:
+1. SSH into host: df -h /u01/dse_data to confirm disk state
+2. Check compaction status: systemctl status thanos-compactor
+3. List large tmp files: find /u01/dse_data -name '*.tmp' -size +1G
+4. If safe, remove stale tmp files and restart: systemctl restart thanos-store
+5. Monitor disk recovery and verify thanos-store returns to UP state
+
+CONFIDENCE:
+High — 4 corroborating signals across Prometheus metrics, Splunk logs, and past incidents."""
+
+
+def get_ai_summary(query, incidents, pages, splunk_data, metrics) -> str:
+    if not COPILOT_TOKEN:
+        print("  ℹ️  COPILOT_TOKEN not set — using stub response.")
+        print("      Set export COPILOT_TOKEN=your_token to enable real AI.\n")
+        return get_ai_summary_stub(query)
+
+    prompt  = build_ai_prompt(query, incidents, pages, splunk_data, metrics)
+    headers = {
+        "Authorization":          f"Bearer {COPILOT_TOKEN}",
+        "Content-Type":           "application/json",
+        "Accept":                 "application/json",
+        "Editor-Version":         "vscode/1.85.0",
+        "Copilot-Integration-Id": "vscode-chat"
+    }
+    payload = {
+        "model":       COPILOT_MODEL,
+        "messages":    [
+            {"role": "system",
+             "content": "You are an expert platform engineer specialising in incident diagnosis."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens":  800,
+        "temperature": 0.2
+    }
+    try:
+        r = requests.post(COPILOT_API_URL, headers=headers,
+                          data=json.dumps(payload), timeout=30)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code
+        print(f"  ⚠️  Copilot API error {code} — using stub.")
+        return get_ai_summary_stub(query)
+    except Exception as e:
+        print(f"  ⚠️  Copilot error: {e} — using stub.")
+        return get_ai_summary_stub(query)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Formatters
+# ══════════════════════════════════════════════════════════════
+
+def format_priority(p: str) -> str:
+    return {"1":"🔴 P1","2":"🟠 P2","3":"🟡 P3","4":"🟢 P4"}.get(p,"⚪ P?")
+
+def format_date(date_str: str) -> str:
+    if not date_str: return "Unknown"
+    try:    return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").strftime("%b %d, %Y")
+    except: return date_str
+
+def wrap_text(text: str, prefix: str, width: int = 65) -> str:
+    words, lines, line = text.split(), [], prefix
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line); line = prefix + word + " "
+        else:
+            line += word + " "
+    if line.strip(): lines.append(line)
+    return "\n".join(lines)
+
+def clean_excerpt(text: str) -> str:
+    return text.replace("@@@hl@@@","").replace("@@@endhl@@@","").strip()
+
+def log_level_icon(level: str) -> str:
+    level = str(level).upper()
+    if level in ("ERROR","ERR","CRITICAL"): return "🔴"
+    if level in ("WARN","WARNING"):         return "🟡"
+    return "⚪"
+
+def metric_health_icon(m: dict) -> str:
+    """Traffic light based on metric name and value heuristics."""
+    if not m["available"]: return "⚫"
+    name = m["name"]
+    try:
+        val = float(m["results"][0]["value"])
+        if name == "store_up":           return "✅" if val == 1 else "❌"
+        if name == "compaction_failures":return "❌" if val > 0 else "✅"
+        if name == "objstore_failures":  return "❌" if val > 0 else "✅"
+        if name == "disk_usage":
+            # Flag if less than 10GB free
+            return "❌" if val < 10_737_418_240 else ("🟡" if val < 21_474_836_480 else "✅")
+    except Exception:
+        pass
+    return "ℹ️"
+
+
+# ══════════════════════════════════════════════════════════════
+#  Display
+# ══════════════════════════════════════════════════════════════
+
+def display_servicenow(incidents: list):
+    print("\n  ┌──────────────────────────────────────────────────────────┐")
+    print("  │  🎫  SERVICENOW — Past Incidents                          │")
+    print("  └──────────────────────────────────────────────────────────┘")
+    if not incidents:
+        print("  No matching incidents found.\n"); return
+    for i, inc in enumerate(incidents, 1):
+        number      = inc.get("number","N/A")
+        description = inc.get("short_description","No description")
+        resolution  = inc.get("close_notes","No resolution notes recorded")
+        resolved_at = format_date(inc.get("resolved_at",""))
+        priority    = format_priority(inc.get("priority","?"))
+        ci          = inc.get("cmdb_ci","Unknown")
+        assigned_to = inc.get("assigned_to","Unknown")
+        print(f"\n  [{i}] {number}  {priority}")
+        print(f"      📋 {description}")
+        print(f"      🖥️  CI: {ci}  |  👤 {assigned_to}  |  📅 {resolved_at}")
+        print(f"      ✅ Resolution:")
+        print(wrap_text(resolution, "         "))
+        print(f"      🔗 {SERVICENOW_INSTANCE}/nav_to.do?uri=incident.do?sysparm_query=number={number}")
+
+
+def display_confluence(pages: list):
+    print("\n  ┌──────────────────────────────────────────────────────────┐")
+    print("  │  📖  CONFLUENCE — Runbooks & RCAs                         │")
+    print("  └──────────────────────────────────────────────────────────┘")
+    if not pages:
+        print("  No matching pages found.\n"); return
+    for i, page in enumerate(pages, 1):
+        title   = page.get("title","Untitled")
+        excerpt = clean_excerpt(page.get("excerpt","No excerpt available"))
+        space   = page.get("space",{}).get("name","Unknown space")
+        page_id = page.get("id","")
+        labels  = [lbl.get("name","") for lbl in
+                   page.get("metadata",{}).get("labels",{}).get("results",[])]
+        print(f"\n  [{i}] 📄 {title}")
+        print(f"      📁 Space: {space}")
+        if labels: print(f"      🏷️  {', '.join(labels)}")
+        print(f"      💬 {excerpt[:220]}...")
+        print(f"      🔗 {CONFLUENCE_BASE_URL}/pages/{page_id}")
+
+
+def display_splunk(splunk_data: dict):
+    window = splunk_data.get("window","1h") if splunk_data else "1h"
+    print("\n  ┌──────────────────────────────────────────────────────────┐")
+    print(f"  │  📡  SPLUNK — Live Logs  (last {window})                       │")
+    print("  └──────────────────────────────────────────────────────────┘")
+    if not splunk_data:
+        print("  Splunk unavailable or no results.\n"); return
+    events      = splunk_data.get("events",[])
+    error_count = splunk_data.get("error_count",0)
+    warn_count  = splunk_data.get("warn_count",0)
+    spl         = splunk_data.get("spl","")
+    print(f"\n  📊 {len(events)} log lines  |  🔴 {error_count} errors  |  🟡 {warn_count} warnings\n")
+    if not events:
+        print(f"  No matching log lines. SPL used: {spl}\n"); return
+    for event in events:
+        ts      = event.get("_time","")[:19].replace("T"," ")
+        host    = event.get("host","")
+        level   = event.get("log_level","INFO")
+        message = event.get("message", str(event))[:120]
+        print(f"  {log_level_icon(level)} [{ts}] {host}")
+        print(f"     {message}")
+    print(f"\n  🔍 SPL: {spl}")
+
+
+def display_metrics(metrics: list):
+    print("\n  ┌──────────────────────────────────────────────────────────┐")
+    print("  │  📈  PROMETHEUS / THANOS — Live Metrics                   │")
+    print("  └──────────────────────────────────────────────────────────┘")
+
+    if not metrics:
+        print("  No metrics collected.\n"); return
+
+    available = [m for m in metrics if m["available"]]
+    missing   = [m for m in metrics if not m["available"]]
+
+    if not available:
+        print(f"  ⚠️  Thanos endpoint unreachable: {THANOS_URL}")
+        print("      Check port 10903 is accessible from this host.\n")
+        return
+
+    print()
+    for m in available:
+        icon = metric_health_icon(m)
+        print(f"  {icon}  {m['description']}")
+        for r in m["results"][:3]:
+            label_str = ", ".join(
+                f"{k}={v}" for k, v in r["labels"].items()
+                if k not in ("__name__",)
+            )
+            label_display = f" [{label_str}]" if label_str else ""
+            print(f"       {r['formatted']}{label_display}")
+
+    if missing:
+        print(f"\n  ⚫ No data: {', '.join(m['description'] for m in missing)}")
+
+    print(f"\n  🔗 {THANOS_URL}/graph")
+
+
+def display_ai_summary(summary: str):
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║  🤖  AI ROOT CAUSE SUMMARY  (GitHub Copilot)             ║")
+    print("  ╚══════════════════════════════════════════════════════════╝\n")
+    for line in summary.splitlines():
+        print(f"  {line}")
+    print()
+
+
+def display_all(incidents, pages, splunk_data, metrics, ai_summary, query, host, window):
+    print("\n" + "═" * 64)
+    print(f"  🔍  INCIDENT INTELLIGENCE  —  Phase 5")
+    print(f"  Query : \"{query}\"")
+    if host: print(f"  Host  : {host}")
+    print(f"  Window: last {window}")
+    print("═" * 64)
+
+    display_servicenow(incidents)
+    display_confluence(pages)
+    display_splunk(splunk_data)
+    display_metrics(metrics)
+    display_ai_summary(ai_summary)
+
+    print("═" * 64)
+    print("  💡 --no-ai  skips AI summary for faster raw output")
+    print("  💡 --window 4h looks further back in Splunk logs")
+    print("═" * 64 + "\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Incident Intelligence — ServiceNow + Confluence + Splunk + Thanos + AI"
+    )
+    parser.add_argument("query", nargs="?",
+                        help="Describe the issue (e.g. 'thanos store disk full')")
+    parser.add_argument("--host", "-H", default=None,
+                        help="Filter Splunk logs to a specific host")
+    parser.add_argument("--window", "-w", default="1h",
+                        help="Splunk + metrics lookback: 30m, 1h, 4h, 24h (default: 1h)")
+    parser.add_argument("--no-ai", action="store_true",
+                        help="Skip AI summary (faster, raw results only)")
+    args = parser.parse_args()
+
+    if not args.query:
+        print("\n🔍 Incident Intelligence Assistant — Phase 5")
+        query = input("   Describe the issue: ").strip()
+    else:
+        query = args.query.strip()
+
+    if not query:
+        print("❌ Please provide a search query.")
+        sys.exit(1)
+
+    host   = args.host
+    window = args.window
+
+    print(f"\n   Searching all sources in parallel...")
+    print(f"   Sources: ServiceNow | Confluence | Splunk | Thanos/Prometheus\n")
+
+    incidents, pages, splunk_data, metrics = [], [], {}, []
+
+    # Run all four data sources concurrently
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(search_incidents, query):             "snow",
+            executor.submit(search_confluence, query):            "confluence",
+            executor.submit(search_splunk, query, host, window):  "splunk",
+            executor.submit(collect_thanos_metrics):              "metrics"
+        }
+        for future in as_completed(futures):
+            source = futures[future]
+            result = future.result()
+            if source == "snow":        incidents   = result
+            elif source == "confluence":pages       = result
+            elif source == "splunk":    splunk_data = result
+            else:                       metrics     = result
+
+    # AI runs after all data is in hand
+    ai_summary = ""
+    if not args.no_ai:
+        print("   Generating AI root cause summary...")
+        ai_summary = get_ai_summary(query, incidents, pages, splunk_data, metrics)
+    else:
+        ai_summary = "AI summary skipped (--no-ai flag used)."
+
+    display_all(incidents, pages, splunk_data, metrics, ai_summary, query, host, window)
+
+
+if __name__ == "__main__":
+    main()
